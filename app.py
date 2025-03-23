@@ -6,7 +6,7 @@ from collections import deque
 from urllib.parse import urlparse, urljoin, urldefrag
 from flask_cors import CORS
 from newspaper import Article
-from transformers import GPTNeoForCausalLM, GPT2Tokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from concurrent.futures import ProcessPoolExecutor
 import logging
 import torch
@@ -15,6 +15,9 @@ import multiprocessing
 import time
 import uuid
 from threading import Thread, Lock
+import psutil
+import time
+from threading import Thread
 
 # Initialize the Flask application
 app = Flask(__name__)
@@ -26,13 +29,13 @@ logger = logging.getLogger(__name__)
 
 # Configuration constants
 MIN_TEXT_LENGTH = 100
-MAX_GPT_INPUT_TOKENS = 512
 DEFAULT_DEPTH = 5
 MAX_WORKERS = (multiprocessing.cpu_count() * 2) + 1
 
-# Initialize GPT-Neo model and tokenizer
-gpt_neo_model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M")
-gpt_neo_tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
+# Initialize TinyBERT model and tokenizer for sentiment analysis.
+# This model is extremely lightweight and ideal for low-resource environments.
+tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-tiny")
+model = AutoModelForSequenceClassification.from_pretrained("prajjwal1/bert-tiny", num_labels=3)
 
 # Initialize ProcessPoolExecutor for CPU-bound tasks
 executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
@@ -41,11 +44,17 @@ executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
 cache = LRUCache(maxsize=5000)
 
 # Helper function for timestamped logging
+def log_memory_usage():
+    process = psutil.Process()
+    while True:
+        mem_info = process.memory_info()
+        print(f"Memory Usage: {mem_info.rss / (1024 * 1024):.2f} MB")  # RSS: Resident Set Size
+        time.sleep(10)  # Adjust the sleep time as needed
 def log(message):
     current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     logger.warning(f"[{current_time}] {message}")
 
-# JobManager Class
+# JobManager Class to manage crawl jobs
 class JobManager:
     def __init__(self):
         self.jobs = {}
@@ -79,7 +88,7 @@ class JobManager:
 # Initialize JobManager
 job_manager = JobManager()
 
-# Helper functions
+# Helper functions for URL validation and normalization
 def is_valid_url(url, base_domain=None):
     try:
         parsed = urlparse(url)
@@ -106,10 +115,12 @@ def normalize_url(url):
     return normalized_url
 
 def is_relevant_text(text):
+    # Ensure the text contains enough sentences
     if len(text.split('. ')) < 3:
         return False
     return True
 
+# Asynchronous function to fetch HTML content from a URL
 async def fetch(session, url):
     try:
         async with session.get(url, timeout=10) as response:
@@ -120,6 +131,7 @@ async def fetch(session, url):
         log(f"Error fetching {url}: {e}")
     return None
 
+# Synchronous function to fetch and parse article text using Newspaper3k
 def fetch_article_text_sync(url):
     log(f"Fetching article text for URL: {url}")
     try:
@@ -132,43 +144,39 @@ def fetch_article_text_sync(url):
         log(f"Error parsing article {url}: {e}")
         return ""
 
-def summarize_text_with_gpt_neo(text, max_length=150):
-    input_text = f"Summarize the following text:\n{text}\n\nSummary:"
-    inputs = gpt_neo_tokenizer(input_text, return_tensors="pt", max_length=MAX_GPT_INPUT_TOKENS, truncation=True)
-    summary_ids = gpt_neo_model.generate(
-        inputs.input_ids,
-        max_length=max_length,
-        num_beams=2,
-        early_stopping=True
-    )
-    summary = gpt_neo_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+# Simple summarization: return the first few sentences as a summary
+def simple_summary(text, num_sentences=3):
+    sentences = text.split('. ')
+    summary = '. '.join(sentences[:num_sentences])
+    if summary and not summary.endswith('.'):
+        summary += '.'
     return summary
 
-def analyze_sentiment_with_gpt_neo(text):
-    input_text = f"Analyze the sentiment of the following text and respond with 'POSITIVE', 'NEUTRAL', or 'NEGATIVE':\n{text}\n\nSentiment:"
-    inputs = gpt_neo_tokenizer(input_text, return_tensors="pt", max_length=MAX_GPT_INPUT_TOKENS, truncation=True)
-    output_ids = gpt_neo_model.generate(
-        inputs.input_ids,
-        max_length=10,
-        num_beams=1,
-        early_stopping=True
-    )
-    sentiment = gpt_neo_tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    
-    if "POSITIVE" in sentiment:
-        return {"star_label": "5 stars", "sentiment_label": "POSITIVE", "sentiment_score": 1.0}
-    elif "NEGATIVE" in sentiment:
-        return {"star_label": "1 star", "sentiment_label": "NEGATIVE", "sentiment_score": 0.0}
-    else:
-        return {"star_label": "3 stars", "sentiment_label": "NEUTRAL", "sentiment_score": 0.5}
+# Sentiment Analysis using TinyBERT
+def get_sentiment(text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        sentiment_score, sentiment_idx = torch.max(predictions, dim=-1)
+    sentiments = ['NEGATIVE', 'NEUTRAL', 'POSITIVE']
+    sentiment_label = sentiments[sentiment_idx.item()]
+    star_label = "5 stars" if sentiment_label == "POSITIVE" else ("1 star" if sentiment_label == "NEGATIVE" else "3 stars")
+    return {
+        "star_label": star_label,
+        "sentiment_label": sentiment_label,
+        "sentiment_score": float(sentiment_score.item())
+    }
 
+# Combine simple summarization and sentiment analysis (with caching)
 @cached(cache)
 def get_summary_and_sentiment(text):
     log("Retrieving summary and sentiment from cache or computing")
-    summary = summarize_text_with_gpt_neo(text)
-    sentiment = analyze_sentiment_with_gpt_neo(text)
+    summary = simple_summary(text)
+    sentiment = get_sentiment(text)
     return summary, sentiment
 
+# Asynchronous processing of a single URL (and its linked pages)
 async def process_url(session, url, method, max_pages, base_domain, processed_urls, job_id):
     pages_crawled = 0
 
@@ -195,6 +203,7 @@ async def process_url(session, url, method, max_pages, base_domain, processed_ur
         if html is None:
             continue
 
+        # Extract links from the page
         links = BeautifulSoup(html, "html.parser", parse_only=SoupStrainer('a'))
         for link in links.find_all('a', href=True):
             full_url = urljoin(current_url, link['href'])
@@ -202,6 +211,7 @@ async def process_url(session, url, method, max_pages, base_domain, processed_ur
             if is_valid_url(full_url, base_domain=base_domain) and normalized_full_url not in processed_urls:
                 queue.append(full_url)
 
+        # Fetch article text synchronously via executor
         page_text = await asyncio.get_event_loop().run_in_executor(executor, fetch_article_text_sync, current_url)
         if len(page_text.strip()) < MIN_TEXT_LENGTH:
             log(f"Skipped {current_url} due to insufficient content.")
@@ -229,6 +239,7 @@ async def process_url(session, url, method, max_pages, base_domain, processed_ur
         pages_crawled += 1
         log(f"Completed processing URL: {current_url}")
 
+# Endpoint to check the status of a crawl job
 @app.route('/status/<job_id>', methods=['GET'])
 def get_status(job_id):
     job = job_manager.get_job(job_id)
@@ -242,6 +253,7 @@ def get_status(job_id):
     }
     return jsonify(response), 200
 
+# Asynchronous function to run crawl tasks for given URLs
 async def run_crawl_async(job_id, urls, method, depth, base_domains):
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         tasks = []
@@ -250,6 +262,7 @@ async def run_crawl_async(job_id, urls, method, depth, base_domains):
             tasks.append(process_url(session, url, method, depth, base_domain, processed_urls, job_id))
         await asyncio.gather(*tasks)
 
+# Wrapper to run asynchronous crawl tasks in a separate event loop
 def run_crawl(job_id, urls, method, depth, base_domains):
     try:
         loop = asyncio.new_event_loop()
@@ -262,6 +275,7 @@ def run_crawl(job_id, urls, method, depth, base_domains):
         log(f"Error in crawl job {job_id}: {e}")
         job_manager.update_job(job_id, status="failed", error=str(e))
 
+# Endpoint to start the analysis/crawl process
 @app.route('/analyse', methods=['POST'])
 def analyse():
     data = request.get_json()
@@ -277,7 +291,6 @@ def analyse():
         return jsonify({"error": "Method must be 'bfs' or 'dfs'."}), 400
 
     job_id = job_manager.create_job()
-
     base_domains = [urlparse(url).netloc for url in urls]
 
     thread = Thread(target=run_crawl, args=(job_id, urls, method, depth, base_domains))
@@ -285,6 +298,8 @@ def analyse():
 
     log(f"Started crawl job {job_id}")
     return jsonify({"job_id": job_id}), 202
+memory_thread = Thread(target=log_memory_usage)
+memory_thread.start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5959, debug=False)
