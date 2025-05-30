@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import asyncio
 import trafilatura
 from summa import summarizer
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from cachetools import LRUCache, cached
 import httpx
 import uuid
@@ -24,7 +24,7 @@ DEFAULT_DEPTH = 2
 CONCURRENT_REQUESTS = 20
 cache = LRUCache(maxsize=5000)
 
-# -- Sentiment analyzer (VADER) --
+# -- Sentiment analyzer (vaderSentiment, no external download needed) --
 sentiment_analyzer = SentimentIntensityAnalyzer()
 
 # -- Job storage --
@@ -88,7 +88,6 @@ Thread(target=log_memory, daemon=True).start()
 semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
 def normalize_url(url):
-    parsed, _ = urlparse(url), urlparse(url).fragment
     url = url.split('#')[0]
     p = urlparse(url)
     norm = p._replace(scheme=p.scheme.lower(), netloc=p.netloc.lower())
@@ -137,7 +136,6 @@ async def fetch_and_process(client, url, depth, domain, seen, job_id):
         full = urljoin(url, a["href"])
         norm = normalize_url(full)
         if is_valid_url(norm, domain):
-            # schedule deeper crawl
             asyncio.create_task(fetch_and_process(client, norm, depth-1, domain, seen, job_id))
 
 @app.route("/analyse", methods=["POST"])
