@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 #     App Initialization
 # -----------------------------
 app = Flask(__name__)
-CORS(app)  # Enable CORS on all routes
+CORS(app)  # Enable CORS for all routes
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 MIN_TEXT_LENGTH = 200
 DEFAULT_LIMIT = 10         # Default # of URLs to scrape if none passed
-CONCURRENT_REQUESTS = 20
+CONCURRENT_WORKERS = 10    # Number of concurrent workers pulling from the queue
 cache = LRUCache(maxsize=5000)
 
 # -----------------------------
@@ -122,88 +122,97 @@ def is_valid_url(url: str, domain: str = None) -> bool:
         return False
 
 # -----------------------------
-#  Single‐Loop Crawler with a Strict URL Limit
+#  Single‐Loop Crawler with Strict URL Limit
 # -----------------------------
 async def crawl_urls(job_id: str, urls: list[str], limit: int):
     """
     Crawl up to `limit` distinct URLs starting from `urls`.
-    This runs on one asyncio loop with:
+    Uses an asyncio.Queue + worker tasks:
       - A shared `seen` set of URLs already fetched
       - A shared `processed` counter (protected by `count_lock`)
-      - A shared semaphore for concurrency
+      - A shared semaphore for HTTP concurrency
+      - Exactly `limit` URLs will be analyzed at most
     """
-    semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+    semaphore = asyncio.Semaphore(CONCURRENT_WORKERS)
     seen = set()
     processed = 0
     count_lock = asyncio.Lock()
 
+    # 1) Create an asyncio.Queue and seed with the initial URLs
+    queue = asyncio.Queue()
+    domains = [urlparse(u).netloc for u in urls]
+    for u, dom in zip(urls, domains):
+        norm_top = normalize_url(u.rstrip("/"))
+        if is_valid_url(norm_top, dom):
+            await queue.put((norm_top, dom))
+
     async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
 
-        async def fetch_and_process(url: str, domain: str):
+        async def worker():
             nonlocal processed
-            # 1) Acquire lock to check & increment `processed`
-            async with count_lock:
-                if processed >= limit or url in seen:
+            while True:
+                # If we've already processed `limit`, exit
+                async with count_lock:
+                    if processed >= limit:
+                        return
+
+                try:
+                    url, domain = queue.get_nowait()
+                except asyncio.QueueEmpty:
                     return
-                seen.add(url)
-                processed += 1
-                current_index = processed  # for debugging if needed
 
-            # 2) Fetch HTML under semaphore
-            try:
-                async with semaphore:
-                    resp = await client.get(url, timeout=10.0)
-                if "text/html" not in resp.headers.get("Content-Type", ""):
+                # Skip if we've seen it already
+                async with count_lock:
+                    if url in seen or processed >= limit:
+                        continue
+                    seen.add(url)
+                    processed += 1  # count this URL toward the limit
+
+                # 2) Fetch HTML under the semaphore
+                try:
+                    async with semaphore:
+                        resp = await client.get(url, timeout=10.0)
+                    if "text/html" not in resp.headers.get("Content-Type", ""):
+                        continue
+                    html = resp.text
+                except Exception as e:
+                    logger.warning(f"Error fetching {url}: {e}")
+                    continue
+
+                # 3) Extract main text with trafilatura
+                content = trafilatura.extract(html)
+                if not content or len(content) < MIN_TEXT_LENGTH:
+                    continue
+
+                # 4) Summarize & sentiment
+                summary, sentiment = analyze_content(content)
+                await update_job(job_id, result={
+                    "url": url,
+                    "summary": summary,
+                    **sentiment
+                })
+
+                # 5) Enqueue children only if we still can process more
+                async with count_lock:
+                    can_continue = (processed < limit)
+                if not can_continue:
                     return
-                html = resp.text
-            except Exception as e:
-                logger.warning(f"Error fetching {url}: {e}")
-                return
 
-            # 3) Extract main text with trafilatura
-            content = trafilatura.extract(html)
-            if not content or len(content) < MIN_TEXT_LENGTH:
-                return
+                soup = BeautifulSoup(html, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    full = urljoin(url, a["href"])
+                    norm_child = normalize_url(full)
+                    if is_valid_url(norm_child, domain):
+                        async with count_lock:
+                            # Only put child in queue if not already seen AND we haven't hit limit
+                            if (norm_child not in seen) and (processed < limit):
+                                await queue.put((norm_child, domain))
 
-            # 4) Summarize & sentiment
-            summary, sentiment = analyze_content(content)
-            await update_job(job_id, result={
-                "url": url,
-                "summary": summary,
-                **sentiment
-            })
+        # 6) Launch a fixed number of concurrent worker tasks
+        workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_WORKERS)]
+        await asyncio.gather(*workers)
 
-            # 5) Enqueue children only if we still haven't hit the limit
-            async with count_lock:
-                can_continue = (processed < limit)
-            if not can_continue:
-                return
-
-            # 6) Parse for <a> links and spawn child tasks
-            soup = BeautifulSoup(html, "html.parser")
-            child_tasks = []
-            for a in soup.find_all("a", href=True):
-                full = urljoin(url, a["href"])
-                norm = normalize_url(full)
-                if is_valid_url(norm, domain):
-                    # Child will re‐check `processed` inside lock before proceeding
-                    child_tasks.append(fetch_and_process(norm, domain))
-
-            if child_tasks:
-                await asyncio.gather(*child_tasks)
-
-        # 7) Kick off initial tasks on each starting URL
-        domains = [urlparse(u).netloc for u in urls]
-        top_tasks = []
-        for u, dom in zip(urls, domains):
-            norm_top = normalize_url(u.rstrip("/"))
-            if is_valid_url(norm_top, dom):
-                top_tasks.append(fetch_and_process(norm_top, dom))
-
-        if top_tasks:
-            await asyncio.gather(*top_tasks)
-
-    # 8) Once finished or limit reached, mark job as completed
+    # 7) Once done or limit reached, mark job as completed
     await update_job(job_id, status="completed")
 
 def crawl_in_background(job_id: str, urls: list[str], limit: int):
