@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 #  Configuration
 # -----------------------------
 MIN_TEXT_LENGTH = 200
-DEFAULT_LIMIT = 10            # default number of URLs to process if none provided
+DEFAULT_LIMIT = 10            # Default number of URLs to process if none provided
 CONCURRENT_REQUESTS = 20
 cache = LRUCache(maxsize=5000)
 
@@ -124,8 +124,7 @@ def is_valid_url(url: str, domain: str = None) -> bool:
 async def crawl_urls(job_id: str, urls: list[str], limit: int):
     """
     Crawl up to `limit` distinct URLs starting from `urls`.
-    Everything runs on one asyncio loop with a shared `seen` set
-    and a shared `semaphore` for concurrency.
+    This runs on one asyncio loop with shared `seen` and `processed` counters.
     """
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
     seen = set()
@@ -135,15 +134,14 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
 
         async def fetch_and_process(url: str, domain: str):
             nonlocal processed
-            # 1) If we've already processed enough URLs or URL is seen, stop
+            # 1) If we reached the limit or this URL was already seen, stop
             if processed >= limit or url in seen:
                 return
-            # 2) Mark as seen and increment counter
             seen.add(url)
             processed += 1
 
             try:
-                # 3) Download HTML under semaphore
+                # 2) Download HTML under semaphore
                 async with semaphore:
                     resp = await client.get(url, timeout=10.0)
                 if "text/html" not in resp.headers.get("Content-Type", ""):
@@ -153,12 +151,12 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
                 logger.warning(f"Error fetching {url}: {e}")
                 return
 
-            # 4) Extract main text
+            # 3) Extract main text
             content = trafilatura.extract(html)
             if not content or len(content) < MIN_TEXT_LENGTH:
                 return
 
-            # 5) Summarize & sentiment
+            # 4) Summarize & sentiment
             summary, sentiment = analyze_content(content)
             await update_job(job_id, result={
                 "url": url,
@@ -166,7 +164,7 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
                 **sentiment
             })
 
-            # 6) If we still can process more URLs, parse children
+            # 5) If we still can process more, enqueue children
             if processed < limit:
                 soup = BeautifulSoup(html, "html.parser")
                 child_tasks = []
@@ -178,24 +176,22 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
                 if child_tasks:
                     await asyncio.gather(*child_tasks)
 
-        # 7) Kick off crawl on each starting URL
+        # 6) Kick off fetch_and_process on each top-level URL
         domains = [urlparse(u).netloc for u in urls]
         top_tasks = []
         for u, dom in zip(urls, domains):
             norm_top = normalize_url(u.rstrip("/"))
             if is_valid_url(norm_top, dom):
                 top_tasks.append(fetch_and_process(norm_top, dom))
-
         if top_tasks:
             await asyncio.gather(*top_tasks)
 
-    # 8) Once done or limit reached, mark job completed
+    # 7) Once done or limit reached, mark job completed
     await update_job(job_id, status="completed")
 
 def crawl_in_background(job_id: str, urls: list[str], limit: int):
     """
-    Create a new asyncio event loop and run crawl_urls(...).
-    Ensures a single loop for all crawling, so `processed` and `seen` behave correctly.
+    Create a fresh asyncio event loop in this thread and run crawl_urls(...).
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -205,31 +201,50 @@ def crawl_in_background(job_id: str, urls: list[str], limit: int):
         loop.close()
 
 # -----------------------------
-#  Flask Endpoints
+#        Flask Endpoints
 # -----------------------------
-@app.route("/analyse", methods=["POST"])
+@app.route("/analyse", methods=["OPTIONS", "POST"])
 def analyse():
+    # 1) Handle CORS preflight
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    # 2) It's a real POST—read JSON and figure out limit/depth
     data = request.get_json() or {}
     urls = data.get("urls") or [data.get("url")]
-    limit = data.get("limit", DEFAULT_LIMIT)
 
-    # Validate URLs
+    # Determine limit:
+    if "limit" in data:
+        try:
+            limit = int(data["limit"])
+        except:
+            return jsonify({"error": "Invalid limit"}), 400
+    elif "depth" in data:
+        try:
+            depth = int(data["depth"])
+            limit = max(1, depth * 10)
+        except:
+            return jsonify({"error": "Invalid depth"}), 400
+    else:
+        limit = DEFAULT_LIMIT
+
+    # Validate each URL
     for u in urls:
         p = urlparse(u)
         if p.scheme not in ("http", "https") or not p.netloc:
             return jsonify({"error": "Invalid URL"}), 400
 
-    # 1) Create job_id immediately
+    # 3) Create job_id immediately
     job_id = asyncio.run(create_job())
 
-    # 2) Start crawl in a background thread
+    # 4) Launch crawl in a background thread
     Thread(
         target=crawl_in_background,
         args=(job_id, urls, limit),
         daemon=True
     ).start()
 
-    # 3) Return job_id at once (HTTP 202 Accepted)
+    # 5) Return job_id at once (HTTP 202 Accepted)
     return jsonify({"job_id": job_id}), 202
 
 @app.route("/status/<job_id>", methods=["GET"])
@@ -240,7 +255,7 @@ def status(job_id):
     return jsonify(job), 200
 
 # -----------------------------
-#  Local development only
+#    Local development only
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5959)
