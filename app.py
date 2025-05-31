@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 #  App initialization
 # -----------------------------
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enable CORS for all routes
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 #  Configuration
 # -----------------------------
 MIN_TEXT_LENGTH = 200
-DEFAULT_DEPTH = 2
+DEFAULT_LIMIT = 10            # default number of URLs to process if none provided
 CONCURRENT_REQUESTS = 20
 cache = LRUCache(maxsize=5000)
 
@@ -68,14 +68,14 @@ async def get_job(job_id):
 # -----------------------------
 @cached(cache)
 def analyze_content(text):
-    # 1) Summarize with TextRank (summa)
+    # Summarize with TextRank (summa)
     try:
         summary = summarizer.summarize(text, ratio=0.1)
         if not summary.strip():
             raise ValueError
     except:
         summary = ". ".join(text.split(". ")[:3]) + "."
-    # 2) Sentiment scoring via vaderSentiment
+    # Sentiment scoring via vaderSentiment
     scores = sentiment_analyzer.polarity_scores(text)
     comp = scores["compound"]
     if comp >= 0.05:
@@ -87,7 +87,7 @@ def analyze_content(text):
     return summary, {"star_label": star, "sentiment_label": label, "sentiment_score": comp}
 
 # -----------------------------
-# Memory usage logger (opt)
+#  Memory usage logger (optional)
 # -----------------------------
 def log_memory_usage():
     proc = psutil.Process()
@@ -99,7 +99,7 @@ def log_memory_usage():
 Thread(target=log_memory_usage, daemon=True).start()
 
 # -----------------------------
-# Helper URL functions
+#  Helper URL functions
 # -----------------------------
 def normalize_url(url: str) -> str:
     url = url.split("#")[0]  # strip any fragment
@@ -119,30 +119,33 @@ def is_valid_url(url: str, domain: str = None) -> bool:
         return False
 
 # -----------------------------
-# Single-event-loop crawler
+#  Single-event-loop crawler with a URL limit
 # -----------------------------
-async def crawl_urls(job_id: str, urls: list[str], depth: int):
+async def crawl_urls(job_id: str, urls: list[str], limit: int):
     """
-    Crawl each URL in `urls` up to `depth`. 
-    This function runs on a single asyncio loop with one shared `seen` set 
-    and one shared Semaphore for concurrency.
+    Crawl up to `limit` distinct URLs starting from `urls`.
+    Everything runs on one asyncio loop with a shared `seen` set
+    and a shared `semaphore` for concurrency.
     """
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-    seen = set()  # <-- single shared set across all branches
+    seen = set()
+    processed = 0
 
     async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
 
-        async def fetch_and_process(url: str, depth_left: int, domain: str):
-            # 1) If we've already seen this URL, or depth_left < 0, stop immediately
-            if depth_left < 0 or url in seen:
+        async def fetch_and_process(url: str, domain: str):
+            nonlocal processed
+            # 1) If we've already processed enough URLs or URL is seen, stop
+            if processed >= limit or url in seen:
                 return
+            # 2) Mark as seen and increment counter
             seen.add(url)
+            processed += 1
 
             try:
-                # 2) Download HTML under Semaphore
+                # 3) Download HTML under semaphore
                 async with semaphore:
                     resp = await client.get(url, timeout=10.0)
-                # 3) Only process if HTML
                 if "text/html" not in resp.headers.get("Content-Type", ""):
                     return
                 html = resp.text
@@ -150,7 +153,7 @@ async def crawl_urls(job_id: str, urls: list[str], depth: int):
                 logger.warning(f"Error fetching {url}: {e}")
                 return
 
-            # 4) Extract main text with trafilatura
+            # 4) Extract main text
             content = trafilatura.extract(html)
             if not content or len(content) < MIN_TEXT_LENGTH:
                 return
@@ -163,57 +166,54 @@ async def crawl_urls(job_id: str, urls: list[str], depth: int):
                 **sentiment
             })
 
-            # 6) If we still have depth (>0), gather child link tasks
-            if depth_left > 0:
+            # 6) If we still can process more URLs, parse children
+            if processed < limit:
                 soup = BeautifulSoup(html, "html.parser")
                 child_tasks = []
                 for a in soup.find_all("a", href=True):
                     full = urljoin(url, a["href"])
                     norm = normalize_url(full)
                     if is_valid_url(norm, domain):
-                        # recurse with depth_left - 1
-                        child_tasks.append(fetch_and_process(norm, depth_left - 1, domain))
+                        child_tasks.append(fetch_and_process(norm, domain))
                 if child_tasks:
                     await asyncio.gather(*child_tasks)
 
-        # 7) Kick off all top-level URLs (same loop, same seen)
+        # 7) Kick off crawl on each starting URL
         domains = [urlparse(u).netloc for u in urls]
         top_tasks = []
         for u, dom in zip(urls, domains):
             norm_top = normalize_url(u.rstrip("/"))
             if is_valid_url(norm_top, dom):
-                top_tasks.append(fetch_and_process(norm_top, depth, dom))
+                top_tasks.append(fetch_and_process(norm_top, dom))
 
         if top_tasks:
             await asyncio.gather(*top_tasks)
 
-    # 8) After all crawling, mark job as completed
+    # 8) Once done or limit reached, mark job completed
     await update_job(job_id, status="completed")
 
-
-def crawl_in_background(job_id: str, urls: list[str], depth: int):
+def crawl_in_background(job_id: str, urls: list[str], limit: int):
     """
-    Create a fresh asyncio event loop and run crawl_urls(...) inside it.
-    This ensures every coroutine (and our Semaphore) lives in one loop.
+    Create a new asyncio event loop and run crawl_urls(...).
+    Ensures a single loop for all crawling, so `processed` and `seen` behave correctly.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(crawl_urls(job_id, urls, depth))
+        loop.run_until_complete(crawl_urls(job_id, urls, limit))
     finally:
         loop.close()
 
 # -----------------------------
-#      Flask Endpoints
+#  Flask Endpoints
 # -----------------------------
 @app.route("/analyse", methods=["POST"])
 def analyse():
     data = request.get_json() or {}
     urls = data.get("urls") or [data.get("url")]
-    depth = data.get("depth", DEFAULT_DEPTH)
+    limit = data.get("limit", DEFAULT_LIMIT)
 
-    # Validate each URL
+    # Validate URLs
     for u in urls:
         p = urlparse(u)
         if p.scheme not in ("http", "https") or not p.netloc:
@@ -222,10 +222,10 @@ def analyse():
     # 1) Create job_id immediately
     job_id = asyncio.run(create_job())
 
-    # 2) Spawn a background thread that runs crawl_in_background(...)
+    # 2) Start crawl in a background thread
     Thread(
         target=crawl_in_background,
-        args=(job_id, urls, depth),
+        args=(job_id, urls, limit),
         daemon=True
     ).start()
 
@@ -240,7 +240,7 @@ def status(job_id):
     return jsonify(job), 200
 
 # -----------------------------
-#    Local development only
+#  Local development only
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5959)
