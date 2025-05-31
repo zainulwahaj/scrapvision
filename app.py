@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 # -----------------------------
 app = Flask(__name__)
 
-# Allow CORS on every route with a wildcard origin
+# Allow CORS on every route (wildcard origin)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 logging.basicConfig(level=logging.WARNING)
@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 MIN_TEXT_LENGTH = 200
 DEFAULT_LIMIT = 10         # Default # of results if none provided
-CONCURRENT_WORKERS = 10    # Number of concurrent worker tasks
 cache = LRUCache(maxsize=5000)
 
 # -----------------------------
@@ -72,9 +71,11 @@ async def get_job(job_id):
 @cached(cache)
 def analyze_content(text: str):
     """
-    1) Summarize with summa.TextRank (fallback to first 3 sentences).
-    2) Sentiment via VADER → compound in [−1,1] → map to confidence ∈ [0.0,1.0].
-    3) Map that confidence to star buckets (1..5).
+    1) Extract an extractive summary using summa.TextRank (fallback to first 3 sentences).
+    2) Run VADER to get a compound score in [-1.0, +1.0].
+    3) Confidence = |compound| ∈ [0.0, 1.0].
+    4) Star rating = round(((compound + 1)/2)*4) + 1  → integer in {1,2,3,4,5}.
+    5) Sentiment label = POSITIVE/NEGATIVE/NEUTRAL.
     """
     # ---- Summarization (TextRank via summa) ----
     try:
@@ -87,22 +88,20 @@ def analyze_content(text: str):
 
     # ---- Sentiment via VADER ----
     scores = sentiment_analyzer.polarity_scores(text)
-    comp = scores["compound"]  # in [−1.0 … +1.0]
+    comp = scores["compound"]  # in [-1.0 … +1.0]
 
-    # ---- Rescale compound to confidence ∈ [0.0 … 1.0] ----
-    conf_float = (comp + 1.0) / 2.0  # 0.0 when comp=−1.0, 1.0 when comp=+1.0
+    # ---- Confidence = absolute(compound) in [0.0 … 1.0] ----
+    confidence = abs(comp)
 
-    # ---- Map confidence to 1..5 star buckets ----
-    if conf_float >= 0.80:
-        star_label = "5 stars"
-    elif conf_float >= 0.60:
-        star_label = "4 stars"
-    elif conf_float >= 0.40:
-        star_label = "3 stars"
-    elif conf_float >= 0.20:
-        star_label = "2 stars"
-    else:
-        star_label = "1 star"
+    # ---- Star rating = discrete 1..5, linear map from [-1..+1] → [1..5] ----
+    #   formula: star_num = round(((comp + 1.0)/2.0)*4.0) + 1
+    star_num = int(round(((comp + 1.0) / 2.0) * 4.0)) + 1
+    # Just in case numerical rounding goes outside 1..5:
+    if star_num < 1:
+        star_num = 1
+    elif star_num > 5:
+        star_num = 5
+    star_label = f"{star_num} stars"
 
     # ---- Sentiment label ----
     if comp > 0:
@@ -115,8 +114,8 @@ def analyze_content(text: str):
     return summary, {
         "star_label": star_label,
         "sentiment_label": sentiment_label,
-        # Return confidence as a float 0.0..1.0 (two decimal places)
-        "sentiment_score": round(conf_float, 3)
+        # Round confidence to 3 decimal places for JSON clarity
+        "sentiment_score": round(confidence, 3)
     }
 
 # -----------------------------
@@ -155,105 +154,82 @@ def is_valid_url(url: str, domain: str = None) -> bool:
 # -----------------------------
 #  Single‐Loop Crawler with Strict “limit” on RESULTS
 # -----------------------------
-async def crawl_urls(job_id: str, urls: list[str], limit: int):
+async def crawl_urls(job_id: str, seed_urls: list[str], limit: int):
     """
-    Crawl pages starting from `urls`, but append exactly up to `limit` results.
-    Uses:
-      - `seen_urls` to avoid duplicates
-      - `result_count` to stop as soon as we have `limit` results
-      - `count_lock` to protect both `seen_urls` and `result_count`
-      - an asyncio.Queue + fixed worker coroutines
+    Perform a breadth‐first traversal (no parallelism) that:
+      - Visits each URL from a FIFO queue.
+      - Extracts content only if it’s valid text/html and ≥ MIN_TEXT_LENGTH.
+      - Appends exactly `limit` results to jobs[job_id]["results"].
+      - Stops immediately once we've gathered `limit` results.
+      - Enqueues children only until `limit` is reached.
     """
-    semaphore = asyncio.Semaphore(CONCURRENT_WORKERS)
     seen_urls = set()
     result_count = 0
-    count_lock = asyncio.Lock()
 
-    # 1) Seed an asyncio.Queue with the initial URLs
-    queue = asyncio.Queue()
-    domains = [urlparse(u).netloc for u in urls]
-    for u, dom in zip(urls, domains):
+    from collections import deque
+    queue = deque()
+    domains = [urlparse(u).netloc for u in seed_urls]
+
+    # 1) Seed the queue with normalized seed URLs
+    for u, dom in zip(seed_urls, domains):
         norm_top = normalize_url(u.rstrip("/"))
         if is_valid_url(norm_top, dom):
-            await queue.put((norm_top, dom))
+            queue.append((norm_top, dom))
 
     async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
+        while queue and result_count < limit:
+            url, domain = queue.popleft()
 
-        async def worker():
-            nonlocal result_count
-            while True:
-                # If we've already appended `limit` results, exit immediately
-                async with count_lock:
-                    if result_count >= limit:
-                        return
+            # Skip if already seen
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
 
-                try:
-                    url, domain = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-
-                # Skip if we've seen it already or if we've hit the result limit
-                async with count_lock:
-                    if url in seen_urls or result_count >= limit:
-                        continue
-                    seen_urls.add(url)
-
-                # 2) Fetch the HTML under the semaphore
-                try:
-                    async with semaphore:
-                        resp = await client.get(url, timeout=10.0)
-                    if "text/html" not in resp.headers.get("Content-Type", ""):
-                        continue
-                    html = resp.text
-                except Exception as e:
-                    logger.warning(f"Error fetching {url}: {e}")
+            # 2) Fetch HTML
+            try:
+                resp = await client.get(url, timeout=10.0)
+                if "text/html" not in resp.headers.get("Content-Type", ""):
                     continue
+                html = resp.text
+            except Exception as e:
+                logger.warning(f"Error fetching {url}: {e}")
+                continue
 
-                # 3) Extract the main text using trafilatura
-                content = trafilatura.extract(html)
-                if not content or len(content) < MIN_TEXT_LENGTH:
-                    continue
+            # 3) Extract main text
+            content = trafilatura.extract(html)
+            if not content or len(content) < MIN_TEXT_LENGTH:
+                continue
 
-                # 4) Summarize & sentiment
-                summary, sentiment_dict = analyze_content(content)
+            # 4) Summarize & sentiment
+            summary, sentiment_dict = analyze_content(content)
 
-                # 5) Append to results *only* if we are still under the limit
-                async with count_lock:
-                    if result_count >= limit:
-                        return
-                    result_count += 1
-
+            # 5) Append exactly one result item if still under the limit
+            if result_count < limit:
+                result_count += 1
                 await update_job(job_id, result={
                     "url": url,
                     "summary": summary,
                     **sentiment_dict
                 })
 
-                # 6) Enqueue child links only if we still can produce more results
-                async with count_lock:
-                    can_add_more = (result_count < limit)
-                if not can_add_more:
-                    return
+            # 6) If we have now reached the limit, break out
+            if result_count >= limit:
+                break
 
-                soup = BeautifulSoup(html, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    full = urljoin(url, a["href"])
-                    norm_child = normalize_url(full)
-                    if is_valid_url(norm_child, domain):
-                        async with count_lock:
-                            if (norm_child not in seen_urls) and (result_count < limit):
-                                await queue.put((norm_child, domain))
+            # 7) Enqueue children (links) so long as we haven't hit `limit`
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                full = urljoin(url, a["href"])
+                norm_child = normalize_url(full)
+                if is_valid_url(norm_child, domain) and norm_child not in seen_urls:
+                    queue.append((norm_child, domain))
 
-        # 7) Launch exactly CONCURRENT_WORKERS asynchronous workers
-        workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_WORKERS)]
-        await asyncio.gather(*workers)
-
-    # 8) Once done (or limit reached), mark the job as completed
+    # 8) Mark job as completed
     await update_job(job_id, status="completed")
 
 def crawl_in_background(job_id: str, urls: list[str], limit: int):
     """
-    Spins up a new asyncio loop and runs `crawl_urls(...)` in this Thread.
+    Spins up a new asyncio event loop in this thread and calls `crawl_urls(...)`.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
