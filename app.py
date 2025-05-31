@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  
 import asyncio
 import trafilatura
 from summa import summarizer
@@ -12,6 +13,9 @@ import time
 from threading import Thread
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
+
+app = Flask(__name__)
+CORS(app)    
 
 # -- App setup --
 app = Flask(__name__)
