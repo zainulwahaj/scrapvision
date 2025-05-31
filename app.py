@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS  
+from flask_cors import CORS
 import asyncio
 import trafilatura
 from summa import summarizer
@@ -14,11 +14,9 @@ from threading import Thread
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 
-app = Flask(__name__)
-CORS(app)    
-
 # -- App setup --
 app = Flask(__name__)
+CORS(app)                              # <-- enable CORS before defining routes
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -28,10 +26,10 @@ DEFAULT_DEPTH = 2
 CONCURRENT_REQUESTS = 20
 cache = LRUCache(maxsize=5000)
 
-# -- Sentiment analyzer (vaderSentiment, no external download needed) --
+# -- Sentiment analyzer (vaderSentiment, no external download) --
 sentiment_analyzer = SentimentIntensityAnalyzer()
 
-# -- Job storage --
+# -- Job storage (in‐memory) --
 jobs = {}
 jobs_lock = asyncio.Lock()
 
@@ -57,17 +55,17 @@ async def get_job(job_id):
     async with jobs_lock:
         return jobs.get(job_id)
 
-# -- Text processing --
+# -- Text processing (cached) --
 @cached(cache)
 def analyze_content(text):
-    # Summarize with TextRank
+    # Summarize via TextRank (summa)
     try:
         summary = summarizer.summarize(text, ratio=0.1)
         if not summary.strip():
             raise ValueError
     except:
         summary = ". ".join(text.split(". ")[:3]) + "."
-    # Sentiment scoring
+    # Sentiment scoring via vaderSentiment
     scores = sentiment_analyzer.polarity_scores(text)
     comp = scores["compound"]
     if comp >= 0.05:
@@ -78,7 +76,7 @@ def analyze_content(text):
         star, label = "3 stars", "NEUTRAL"
     return summary, {"star_label": star, "sentiment_label": label, "sentiment_score": comp}
 
-# -- Memory logging --
+# -- Memory logging (optional) --
 def log_memory():
     proc = psutil.Process()
     while True:
@@ -88,16 +86,16 @@ def log_memory():
 
 Thread(target=log_memory, daemon=True).start()
 
-# -- Async crawl --
+# -- Crawl implementation (async) --
 semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
-def normalize_url(url):
-    url = url.split('#')[0]
+def normalize_url(url: str) -> str:
+    url = url.split("#")[0]
     p = urlparse(url)
     norm = p._replace(scheme=p.scheme.lower(), netloc=p.netloc.lower())
-    return norm.geturl().rstrip('/')
+    return norm.geturl().rstrip("/")
 
-def is_valid_url(url, domain=None):
+def is_valid_url(url: str, domain: str = None) -> bool:
     try:
         p = urlparse(url)
         if p.scheme not in ("http", "https") or not p.netloc:
@@ -108,10 +106,11 @@ def is_valid_url(url, domain=None):
     except:
         return False
 
-async def fetch_and_process(client, url, depth, domain, seen, job_id):
+async def fetch_and_process(client, url: str, depth: int, domain: str, seen: set, job_id: str):
     if depth < 0 or url in seen:
         return
     seen.add(url)
+
     try:
         async with semaphore:
             resp = await client.get(url, timeout=10.0)
@@ -122,11 +121,12 @@ async def fetch_and_process(client, url, depth, domain, seen, job_id):
         logger.warning(f"Error fetching {url}: {e}")
         return
 
-    # extract main text
+    # Extract main text using trafilatura
     content = trafilatura.extract(html)
     if not content or len(content) < MIN_TEXT_LENGTH:
         return
 
+    # Summarize & sentiment
     summary, sentiment = analyze_content(content)
     await update_job(job_id, result={
         "url": url,
@@ -134,13 +134,14 @@ async def fetch_and_process(client, url, depth, domain, seen, job_id):
         **sentiment
     })
 
-    # parse links with BeautifulSoup
+    # Parse links via BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
         full = urljoin(url, a["href"])
         norm = normalize_url(full)
         if is_valid_url(norm, domain):
-            asyncio.create_task(fetch_and_process(client, norm, depth-1, domain, seen, job_id))
+            # Recurse asynchronously
+            asyncio.create_task(fetch_and_process(client, norm, depth - 1, domain, seen, job_id))
 
 @app.route("/analyse", methods=["POST"])
 def analyse():
@@ -148,7 +149,7 @@ def analyse():
     urls = data.get("urls") or [data.get("url")]
     depth = data.get("depth", DEFAULT_DEPTH)
 
-    # validate
+    # Validate URLs
     for u in urls:
         p = urlparse(u)
         if p.scheme not in ("http", "https") or not p.netloc:
