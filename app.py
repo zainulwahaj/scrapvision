@@ -22,14 +22,23 @@ app = Flask(__name__)
 # Allow CORS on every route (wildcard origin)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
+# -----------------------------
+#     Logging Configuration
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("scrapvision")
 
 # -----------------------------
 #     Configuration
 # -----------------------------
 MIN_TEXT_LENGTH = 200
-DEFAULT_LIMIT = 10         # Default # of results if none provided
+DEFAULT_LIMIT = 10            # Default # of results if none provided
+CONCURRENT_WORKERS = 10       # Number of concurrent worker tasks
+MAX_SUMMARY_WORDS = 30        # Maximum number of words in each summary
 cache = LRUCache(maxsize=5000)
 
 # -----------------------------
@@ -71,20 +80,29 @@ async def get_job(job_id):
 @cached(cache)
 def analyze_content(text: str):
     """
-    1) Extract an extractive summary using summa.TextRank (fallback to first 3 sentences).
-    2) Run VADER to get a compound score in [-1.0, +1.0].
-    3) Confidence = |compound| ∈ [0.0, 1.0].
-    4) Star rating = round(((compound + 1)/2)*4) + 1  → integer in {1,2,3,4,5}.
-    5) Sentiment label = POSITIVE/NEGATIVE/NEUTRAL.
+    1) Summarize with summa.TextRank (fallback to first MAX_SUMMARY_WORDS words).
+    2) Sentiment via VADER → compound in [-1,1] → map to confidence ∈ [0.0,1.0].
+    3) Map that confidence to star buckets (1..5).
     """
-    # ---- Summarization (TextRank via summa) ----
+    summary = ""
     try:
+        # ---- Summarization (TextRank via summa) ----
         summary = summarizer.summarize(text, ratio=0.1)
         if not summary.strip():
-            raise ValueError
-    except:
-        # Fallback: first 3 sentences
-        summary = ". ".join(text.split(". ")[:3]) + "."
+            raise ValueError("summa returned empty summary")
+    except Exception as e:
+        # Fallback: first few sentences up to MAX_SUMMARY_WORDS words
+        logger.debug(f"Summa failed or returned empty, falling back: {e}")
+        sentences = text.split(". ")
+        fallback = " ".join(sentences[:3]) + "."
+        summary = fallback
+
+    # Trim summary to MAX_SUMMARY_WORDS words
+    words = summary.split()
+    if len(words) > MAX_SUMMARY_WORDS:
+        words = words[:MAX_SUMMARY_WORDS]
+        words[-1] = words[-1].rstrip(".,;:!?") + "…"  # add ellipsis to last word
+    summary = " ".join(words)
 
     # ---- Sentiment via VADER ----
     scores = sentiment_analyzer.polarity_scores(text)
@@ -94,9 +112,8 @@ def analyze_content(text: str):
     confidence = abs(comp)
 
     # ---- Star rating = discrete 1..5, linear map from [-1..+1] → [1..5] ----
-    #   formula: star_num = round(((comp + 1.0)/2.0)*4.0) + 1
+    #    formula: star_num = round(((comp + 1.0)/2.0)*4.0) + 1
     star_num = int(round(((comp + 1.0) / 2.0) * 4.0)) + 1
-    # Just in case numerical rounding goes outside 1..5:
     if star_num < 1:
         star_num = 1
     elif star_num > 5:
@@ -114,8 +131,7 @@ def analyze_content(text: str):
     return summary, {
         "star_label": star_label,
         "sentiment_label": sentiment_label,
-        # Round confidence to 3 decimal places for JSON clarity
-        "sentiment_score": round(confidence, 3)
+        "sentiment_score": round(confidence, 3),
     }
 
 # -----------------------------
@@ -125,7 +141,7 @@ def log_memory_usage():
     proc = psutil.Process()
     while True:
         mb = proc.memory_info().rss / (1024**2)
-        logger.warning(f"Memory usage: {mb:.1f} MB")
+        logger.info(f"Memory usage: {mb:.1f} MB")
         time.sleep(30)
 
 Thread(target=log_memory_usage, daemon=True).start()
@@ -148,7 +164,7 @@ def is_valid_url(url: str, domain: str = None) -> bool:
         if domain and p.netloc != domain:
             return False
         return True
-    except:
+    except Exception:
         return False
 
 # -----------------------------
@@ -156,80 +172,84 @@ def is_valid_url(url: str, domain: str = None) -> bool:
 # -----------------------------
 async def crawl_urls(job_id: str, seed_urls: list[str], limit: int):
     """
-    Perform a breadth‐first traversal (no parallelism) that:
-      - Visits each URL from a FIFO queue.
-      - Extracts content only if it’s valid text/html and ≥ MIN_TEXT_LENGTH.
-      - Appends exactly `limit` results to jobs[job_id]["results"].
-      - Stops immediately once we've gathered `limit` results.
-      - Enqueues children only until `limit` is reached.
+    Perform a breadth‐first traversal of `seed_urls`, but append exactly up to `limit` results.
+    Stops immediately once `limit` results are stored.
     """
-    seen_urls = set()
-    result_count = 0
+    try:
+        from collections import deque
+        seen_urls = set()
+        result_count = 0
+        queue = deque()
+        domains = [urlparse(u).netloc for u in seed_urls]
 
-    from collections import deque
-    queue = deque()
-    domains = [urlparse(u).netloc for u in seed_urls]
+        # 1) Seed the queue
+        for u, dom in zip(seed_urls, domains):
+            norm_top = normalize_url(u.rstrip("/"))
+            if is_valid_url(norm_top, dom):
+                queue.append((norm_top, dom))
 
-    # 1) Seed the queue with normalized seed URLs
-    for u, dom in zip(seed_urls, domains):
-        norm_top = normalize_url(u.rstrip("/"))
-        if is_valid_url(norm_top, dom):
-            queue.append((norm_top, dom))
+        async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
+            while queue and result_count < limit:
+                url, domain = queue.popleft()
 
-    async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
-        while queue and result_count < limit:
-            url, domain = queue.popleft()
-
-            # Skip if already seen
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            # 2) Fetch HTML
-            try:
-                resp = await client.get(url, timeout=10.0)
-                if "text/html" not in resp.headers.get("Content-Type", ""):
+                if url in seen_urls:
                     continue
-                html = resp.text
-            except Exception as e:
-                logger.warning(f"Error fetching {url}: {e}")
-                continue
+                seen_urls.add(url)
 
-            # 3) Extract main text
-            content = trafilatura.extract(html)
-            if not content or len(content) < MIN_TEXT_LENGTH:
-                continue
+                # 2) Fetch HTML
+                try:
+                    resp = await client.get(url, timeout=10.0)
+                    if "text/html" not in resp.headers.get("Content-Type", ""):
+                        continue
+                    html = resp.text
+                except Exception as e:
+                    logger.warning(f"[crawl_urls] Failed to fetch {url}: {e}")
+                    continue
 
-            # 4) Summarize & sentiment
-            summary, sentiment_dict = analyze_content(content)
+                # 3) Extract main text
+                content = trafilatura.extract(html)
+                if not content or len(content) < MIN_TEXT_LENGTH:
+                    continue
 
-            # 5) Append exactly one result item if still under the limit
-            if result_count < limit:
-                result_count += 1
-                await update_job(job_id, result={
-                    "url": url,
-                    "summary": summary,
-                    **sentiment_dict
-                })
+                # 4) Summarize & sentiment
+                try:
+                    summary, sentiment_dict = analyze_content(content)
+                except Exception as e:
+                    logger.error(f"[crawl_urls] analyze_content error for {url}: {e}", exc_info=True)
+                    continue
 
-            # 6) If we have now reached the limit, break out
-            if result_count >= limit:
-                break
+                # 5) Append if still under limit
+                if result_count < limit:
+                    result_count += 1
+                    await update_job(job_id, result={
+                        "url": url,
+                        "summary": summary,
+                        **sentiment_dict
+                    })
 
-            # 7) Enqueue children (links) so long as we haven't hit `limit`
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.find_all("a", href=True):
-                full = urljoin(url, a["href"])
-                norm_child = normalize_url(full)
-                if is_valid_url(norm_child, domain) and norm_child not in seen_urls:
-                    queue.append((norm_child, domain))
+                # 6) Stop if limit reached
+                if result_count >= limit:
+                    break
 
-    # 8) Mark job as completed
-    await update_job(job_id, status="completed")
+                # 7) Enqueue children
+                soup = BeautifulSoup(html, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    full = urljoin(url, a["href"])
+                    norm_child = normalize_url(full)
+                    if is_valid_url(norm_child, domain) and norm_child not in seen_urls:
+                        queue.append((norm_child, domain))
+
+        # 8) Mark job completed
+        await update_job(job_id, status="completed")
+
+    except Exception as e:
+        # Catch any unexpected exception, log it, and mark job as failed
+        logger.error(f"[crawl_urls] Unexpected error: {e}", exc_info=True)
+        await update_job(job_id, status="failed", error=str(e))
 
 def crawl_in_background(job_id: str, urls: list[str], limit: int):
     """
-    Spins up a new asyncio event loop in this thread and calls `crawl_urls(...)`.
+    Spins up a new asyncio loop in this thread and runs `crawl_urls`.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -247,41 +267,50 @@ def analyse():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    # ---- Real POST request ----
-    data = request.get_json() or {}
-    urls = data.get("urls") or [data.get("url")]
-
-    # Determine `limit` (default if not provided)
     try:
-        limit = int(data.get("limit", DEFAULT_LIMIT))
-    except:
-        return jsonify({"error": "Invalid limit"}), 400
+        data = request.get_json() or {}
+        urls = data.get("urls") or [data.get("url")]
 
-    # Validate each URL
-    for u in urls:
-        p = urlparse(u)
-        if p.scheme not in ("http", "https") or not p.netloc:
-            return jsonify({"error": "Invalid URL"}), 400
+        # Determine `limit`
+        try:
+            limit = int(data.get("limit", DEFAULT_LIMIT))
+            if limit < 1:
+                raise ValueError("limit must be ≥ 1")
+        except Exception as e:
+            return jsonify({"error": f"Invalid limit: {e}"}), 400
 
-    # 1) Create a new job entry
-    job_id = asyncio.run(create_job())
+        # Validate each URL
+        for u in urls:
+            p = urlparse(u)
+            if p.scheme not in ("http", "https") or not p.netloc:
+                return jsonify({"error": f"Invalid URL: {u}"}), 400
 
-    # 2) Start the crawler in a background thread
-    Thread(
-        target=crawl_in_background,
-        args=(job_id, urls, limit),
-        daemon=True
-    ).start()
+        # Create a new job
+        job_id = asyncio.run(create_job())
 
-    # 3) Immediately return the job_id (HTTP 202 Accepted)
-    return jsonify({"job_id": job_id}), 202
+        # Launch background crawler
+        Thread(
+            target=crawl_in_background,
+            args=(job_id, urls, limit),
+            daemon=True
+        ).start()
+
+        return jsonify({"job_id": job_id}), 202
+
+    except Exception as e:
+        logger.error(f"[endpoint /analyse] unexpected error: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/status/<job_id>", methods=["GET"])
 def status(job_id):
-    job = asyncio.run(get_job(job_id))
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify(job), 200
+    try:
+        job = asyncio.run(get_job(job_id))
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify(job), 200
+    except Exception as e:
+        logger.error(f"[endpoint /status] unexpected error: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # -----------------------------
 #  Local Development Only
