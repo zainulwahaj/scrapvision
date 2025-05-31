@@ -18,7 +18,10 @@ from bs4 import BeautifulSoup
 #     App Initialization
 # -----------------------------
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# Explicitly allow CORS on every route and every method using wildcard
+CORS(app, resources={r"/*": {"origins": "*"}})
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
