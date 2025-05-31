@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import asyncio
 import trafilatura
+from summa import summarizer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from cachetools import LRUCache, cached
 import httpx
 import uuid
@@ -12,19 +14,11 @@ from threading import Thread
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 
-# Import the LexRank summarizer from sumy
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lex_rank import LexRankSummarizer
-
-# Import VADER sentiment
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-
 # -----------------------------
 #     App Initialization
 # -----------------------------
 app = Flask(__name__)
-CORS(app)  # Enable CORS on all routes
+CORS(app)  # Enable CORS for all routes
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -33,13 +27,13 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 MIN_TEXT_LENGTH = 200
 DEFAULT_LIMIT = 10         # Default # of URLs to scrape if none passed
-CONCURRENT_WORKERS = 10    # Number of concurrent worker tasks
+CONCURRENT_WORKERS = 10    # Number of concurrent workers pulling from the queue
 cache = LRUCache(maxsize=5000)
 
 # -----------------------------
-#  Sentiment Analyzer (VADER)
+#  Sentiment Analyzer (bundled)
 # -----------------------------
-vader = SentimentIntensityAnalyzer()
+sentiment_analyzer = SentimentIntensityAnalyzer()
 
 # -----------------------------
 #  In‐Memory Job Storage
@@ -72,31 +66,29 @@ async def get_job(job_id):
 # -----------------------------
 #  Text Processing (cached)
 # -----------------------------
-def lexrank_summary(text: str, sentence_count: int = 3) -> str:
-    """
-    Return an extractive summary by LexRank (sumy) of exactly `sentence_count` sentences.
-    """
-    parser = PlaintextParser.from_string(text, Tokenizer("english"))
-    summarizer = LexRankSummarizer()
-    summary_sentences = summarizer(parser.document, sentence_count)
-    return " ".join(str(s) for s in summary_sentences)
-
 @cached(cache)
-def analyze_content(text: str):
+def analyze_content(text):
     """
-    1) Summarize with sumy LexRank (exactly 3 sentences).
-    2) Sentiment via VADER, rescale to confidence 0–100 and 1–5 star buckets.
+    Summarize via summa.TextRank and perform sentiment analysis via VADER.
+    Then rescale VADER's compound score ([-1,1]) into [0,100] and map to 1–5 stars.
     """
-    # ---- Summarization: LexRank (sumy) ----
-    summary = lexrank_summary(text, sentence_count=3)
+    # 1) Summarize (TextRank via summa)
+    try:
+        summary = summarizer.summarize(text, ratio=0.1)
+        if not summary.strip():
+            raise ValueError
+    except:
+        # Fallback: first 3 sentences
+        summary = ". ".join(text.split(". ")[:3]) + "."
 
-    # ---- Sentiment: VADER compound → 0..100, then map to 1..5 stars ----
-    scores = vader.polarity_scores(text)
-    comp = scores["compound"]            # in [-1.0 .. +1.0]
-    # Rescale to 0..100
+    # 2) Sentiment via VADER
+    scores = sentiment_analyzer.polarity_scores(text)
+    comp = scores["compound"]  # in [-1.0 ... +1.0]
+
+    # 3) Rescale compound to an integer 0..100
     conf_pct = int(((comp + 1.0) / 2.0) * 100)
 
-    # Map to 1..5 stars
+    # 4) Map 0..100 confidence into 1..5 stars
     if conf_pct >= 80:
         star_label = "5 stars"
     elif conf_pct >= 60:
@@ -108,7 +100,7 @@ def analyze_content(text: str):
     else:
         star_label = "1 star"
 
-    # Sentiment label (positive/negative/neutral)
+    # 5) Sentiment label
     if comp > 0:
         sentiment_label = "POSITIVE"
     elif comp < 0:
@@ -138,18 +130,13 @@ Thread(target=log_memory_usage, daemon=True).start()
 #  URL Normalization / Validation
 # -----------------------------
 def normalize_url(url: str) -> str:
-    """
-    Lowercase scheme/host, strip fragments, and remove trailing slash.
-    """
+    # Strip fragment, lowercase scheme & host
     url = url.split("#")[0]
     p = urlparse(url)
     norm = p._replace(scheme=p.scheme.lower(), netloc=p.netloc.lower())
     return norm.geturl().rstrip("/")
 
 def is_valid_url(url: str, domain: str = None) -> bool:
-    """
-    Return True if url has http/https scheme and matches domain (if provided).
-    """
     try:
         p = urlparse(url)
         if p.scheme not in ("http", "https") or not p.netloc:
@@ -166,19 +153,18 @@ def is_valid_url(url: str, domain: str = None) -> bool:
 async def crawl_urls(job_id: str, urls: list[str], limit: int):
     """
     Crawl up to `limit` distinct URLs starting from `urls`.
-    Uses:
-      - An asyncio.Queue seeded with the starting URLs
-      - A shared `seen` set to avoid duplicates
-      - A shared `processed` counter protected by `count_lock`
-      - A semaphore of size CONCURRENT_WORKERS to limit concurrency
-      - Exactly `limit` distinct URLs will be fetched & analyzed
+    Uses an asyncio.Queue + worker tasks:
+      - A shared `seen` set of URLs already fetched
+      - A shared `processed` counter (protected by `count_lock`)
+      - A shared semaphore for HTTP concurrency
+      - Exactly `limit` URLs will be analyzed at most
     """
     semaphore = asyncio.Semaphore(CONCURRENT_WORKERS)
     seen = set()
     processed = 0
     count_lock = asyncio.Lock()
 
-    # 1) Build an asyncio.Queue and enqueue the initial URLs
+    # 1) Create an asyncio.Queue and seed with the initial URLs
     queue = asyncio.Queue()
     domains = [urlparse(u).netloc for u in urls]
     for u, dom in zip(urls, domains):
@@ -191,7 +177,7 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
         async def worker():
             nonlocal processed
             while True:
-                # 2) If we've already processed `limit` URLs, exit
+                # If we've already processed `limit`, exit
                 async with count_lock:
                     if processed >= limit:
                         return
@@ -201,14 +187,14 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
                 except asyncio.QueueEmpty:
                     return
 
-                # 3) Acquire lock to check/mark this URL
+                # Skip if we've seen it already
                 async with count_lock:
                     if url in seen or processed >= limit:
                         continue
                     seen.add(url)
-                    processed += 1
+                    processed += 1  # count this URL toward the limit
 
-                # 4) Fetch HTML under semaphore
+                # 2) Fetch HTML under the semaphore
                 try:
                     async with semaphore:
                         resp = await client.get(url, timeout=10.0)
@@ -219,20 +205,20 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
                     logger.warning(f"Error fetching {url}: {e}")
                     continue
 
-                # 5) Extract main text with trafilatura
+                # 3) Extract main text with trafilatura
                 content = trafilatura.extract(html)
                 if not content or len(content) < MIN_TEXT_LENGTH:
                     continue
 
-                # 6) Summarize & sentiment
-                summary, sentiment_dict = analyze_content(content)
+                # 4) Summarize & sentiment
+                summary, sentiment = analyze_content(content)
                 await update_job(job_id, result={
                     "url": url,
                     "summary": summary,
-                    **sentiment_dict
+                    **sentiment
                 })
 
-                # 7) Enqueue children if we still can process more
+                # 5) Enqueue children only if we still can process more
                 async with count_lock:
                     can_continue = (processed < limit)
                 if not can_continue:
@@ -244,20 +230,20 @@ async def crawl_urls(job_id: str, urls: list[str], limit: int):
                     norm_child = normalize_url(full)
                     if is_valid_url(norm_child, domain):
                         async with count_lock:
-                            # Only enqueue if not seen and under limit
+                            # Only put child in queue if not already seen AND we haven't hit limit
                             if (norm_child not in seen) and (processed < limit):
                                 await queue.put((norm_child, domain))
 
-        # 8) Launch concurrent workers
+        # 6) Launch a fixed number of concurrent worker tasks
         workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_WORKERS)]
         await asyncio.gather(*workers)
 
-    # 9) Mark job as completed
+    # 7) Once done or limit reached, mark job as completed
     await update_job(job_id, status="completed")
 
 def crawl_in_background(job_id: str, urls: list[str], limit: int):
     """
-    Create a new asyncio loop in this thread, run crawl_urls(), then close.
+    Create a dedicated asyncio event loop in this thread and run `crawl_urls(...)`.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
